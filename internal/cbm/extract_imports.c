@@ -30,6 +30,9 @@ static void parse_ruby_imports(CBMExtractCtx *ctx);
 static void parse_lua_imports(CBMExtractCtx *ctx);
 static void parse_r_imports(CBMExtractCtx *ctx);
 static void parse_kotlin_imports(CBMExtractCtx *ctx);
+static void parse_dart_imports(CBMExtractCtx *ctx);
+static void parse_haskell_imports(CBMExtractCtx *ctx);
+static void parse_zig_imports(CBMExtractCtx *ctx);
 static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type);
 static void parse_wolfram_imports(CBMExtractCtx *ctx);
 
@@ -902,6 +905,114 @@ static void parse_kotlin_imports(CBMExtractCtx *ctx) {
     ts_tree_cursor_delete(&cursor);
 }
 
+// Find the first descendant node of `type` (DFS, pre-order). Returns true and
+// writes *out on the first match. Shared by the Dart/Zig import parsers, whose
+// URI/string is nested several levels below the import node.
+static bool find_first_descendant_of(TSNode node, const char *type, // NOLINT(misc-no-recursion)
+                                     TSNode *out) {
+    if (strcmp(ts_node_type(node), type) == 0) {
+        *out = node;
+        return true;
+    }
+    uint32_t n = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        if (find_first_descendant_of(ts_node_named_child(node, i), type, out)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// --- Dart imports ---
+// tree-sitter-dart wraps each top-level import as `import_or_export`; the URI is
+// a `string_literal` nested under library_import -> import_specification ->
+// configurable_uri -> uri. The old dispatch matched "import_declaration" (which
+// tree-sitter-dart never emits) -> 0 imports. Find the first string_literal under
+// each import_or_export and strip its quotes.
+static void parse_dart_imports(CBMExtractCtx *ctx) {
+    CBMArena *a = ctx->arena;
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (strcmp(ts_node_type(node), "import_or_export") != 0) {
+            continue;
+        }
+        TSNode uri = node;
+        if (find_first_descendant_of(node, "string_literal", &uri)) {
+            char *path = strip_quotes(a, cbm_node_text(a, uri, ctx->source));
+            if (path && path[0]) {
+                CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+                cbm_imports_push(&ctx->result->imports, a, imp);
+            }
+        }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+}
+
+// --- Haskell imports ---
+// tree-sitter-haskell nests imports under an `imports` container (and/or lists
+// `import` nodes); each `import` carries a `module` field. parse_generic_imports
+// only scanned root children for "import", missing the container -> 0 imports.
+// Descend into `imports` (and accept a root-level `import`) and reuse the generic
+// path extractors, which pick up the "module" field.
+static void parse_haskell_imports(CBMExtractCtx *ctx) {
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        if (strcmp(kind, "import") == 0) {
+            extract_one_import_header(ctx, node);
+        } else if (strcmp(kind, "imports") == 0) {
+            uint32_t nc = ts_node_child_count(node);
+            for (uint32_t j = 0; j < nc; j++) {
+                TSNode child = ts_node_child(node, j);
+                if (strcmp(ts_node_type(child), "import") == 0) {
+                    extract_one_import_header(ctx, child);
+                }
+            }
+        }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+}
+
+// --- Zig imports ---
+// Zig imports are `const std = @import("std");` — a `builtin_function` (@import)
+// nested inside a variable_declaration, NOT a root child. The old dispatch scanned
+// root for "builtin_function" -> 0. DFS the whole tree for builtin_function nodes
+// whose text starts with @import/@cImport and take their first string argument.
+static void parse_zig_imports(CBMExtractCtx *ctx) {
+    CBMArena *a = ctx->arena;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, a, CBM_SZ_512);
+    ts_nstack_push(&stack, a, ctx->root);
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
+        if (strcmp(ts_node_type(node), "builtin_function") == 0) {
+            char *bf = cbm_node_text(a, node, ctx->source);
+            if (bf && (strncmp(bf, "@import", sizeof("@import") - 1) == 0 ||
+                       strncmp(bf, "@cImport", sizeof("@cImport") - 1) == 0)) {
+                TSNode str = node;
+                if (find_first_descendant_of(node, "string", &str)) {
+                    char *path = strip_quotes(a, cbm_node_text(a, str, ctx->source));
+                    if (path && path[0]) {
+                        CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+                        cbm_imports_push(&ctx->result->imports, a, imp);
+                    }
+                }
+            }
+        }
+        ts_nstack_push_children(&stack, a, node);
+    }
+}
+
 // --- Wolfram imports ---
 // get_top: << "package" (Get["file"])
 // apply where first child is builtin_symbol "Needs" with string arg
@@ -1121,13 +1232,13 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_generic_imports(ctx, "command");
         break;
     case CBM_LANG_ZIG:
-        parse_generic_imports(ctx, "builtin_function");
+        parse_zig_imports(ctx);
         break;
     case CBM_LANG_ERLANG:
         parse_generic_imports(ctx, "module_attribute");
         break;
     case CBM_LANG_HASKELL:
-        parse_generic_imports(ctx, "import");
+        parse_haskell_imports(ctx);
         break;
     case CBM_LANG_OCAML:
         parse_generic_imports(ctx, "open_module");
@@ -1143,8 +1254,10 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_generic_imports(ctx, "groovy_import");
         break;
     case CBM_LANG_SWIFT:
-    case CBM_LANG_DART:
         parse_generic_imports(ctx, "import_declaration");
+        break;
+    case CBM_LANG_DART:
+        parse_dart_imports(ctx);
         break;
     case CBM_LANG_LEAN:
         parse_generic_imports(ctx, "import");
